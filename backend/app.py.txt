@@ -1,0 +1,106 @@
+# app.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+import os
+import openai
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env if present
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in environment")
+
+openai.api_key = OPENAI_API_KEY
+
+app = FastAPI(title="Health Test Recommendation API")
+
+# Allow local frontend dev (adjust origins when deploying)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class RecommendRequest(BaseModel):
+    age: int | None = None
+    sex: str | None = None
+    symptoms: str
+
+class RecommendResponse(BaseModel):
+    recommended_tests: list[str]
+    rationale: str
+    follow_up: str | None = None
+
+def build_prompt(age, sex, symptoms):
+    header = "You are a medical assistant that recommends diagnostic tests."
+    constraints = (
+        "Respond concisely. Return a JSON object with keys: recommended_tests (list of test names), "
+        "rationale (short sentence for each recommended test), and follow_up (optional next steps). "
+        "Do NOT provide definitive diagnosis. Use conservative, non-alarming language."
+    )
+    demographics = f"Patient info: age={age if age else 'unknown'}, sex={sex if sex else 'unknown'}."
+    user_symptoms = f"Symptoms: {symptoms}"
+    return "\n\n".join([header, constraints, demographics, user_symptoms])
+
+@app.post("/recommend", response_model=RecommendResponse)
+async def recommend(req: RecommendRequest):
+    prompt = build_prompt(req.age, req.sex, req.symptoms)
+
+    try:
+        # Chat completion approach
+        response = openai.ChatCompletion.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful clinical decision support assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=400,
+            temperature=0.0,
+        )
+        assistant_text = response.choices[0].message["content"].strip()
+
+        # Try to parse JSON block if model returned JSON
+        import json
+        try:
+            # find first { ... } block
+            start = assistant_text.find("{")
+            end = assistant_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                payload = json.loads(assistant_text[start:end+1])
+            else:
+                # fallback: ask model to return simple comma-separated list and text
+                raise ValueError("No JSON found")
+        except Exception:
+            # Fallback parsing: put whole text into rationale and empty tests
+            payload = {
+                "recommended_tests": [],
+                "rationale": assistant_text,
+                "follow_up": None
+            }
+
+        # Normalize
+        recommended_tests = payload.get("recommended_tests") or []
+        rationale = payload.get("rationale") or ""
+        follow_up = payload.get("follow_up")
+
+        return RecommendResponse(
+            recommended_tests=recommended_tests,
+            rationale=rationale,
+            follow_up=follow_up
+        )
+
+    except openai.error.OpenAIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn, os
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
